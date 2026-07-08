@@ -1,0 +1,29 @@
+name: Compiler le plugin DeACoudre
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+
+      - name: Compiler avec Maven
+        run: mvn -B clean package
+
+      - name: Publier le .jar compilé
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeACoudre-plugin
+          path: target/*.jar
