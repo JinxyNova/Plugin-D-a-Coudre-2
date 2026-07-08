@@ -1,0 +1,20 @@
+name: DeACoudre
+version: '1.0.0'
+main: fr.merci.deacoudre.DeACoudrePlugin
+api-version: '1.20'
+author: Merci
+description: Minigame "Dé à Coudre" - la zone se remplit d'eau, dernier survivant gagne
+
+commands:
+  dac:
+    description: Commande principale du plugin DeACoudre
+    usage: /dac <join|leave|...>
+    aliases: [thimble, deacoudre]
+
+permissions:
+  dac.admin:
+    description: Permet de configurer et gérer les parties DeACoudre
+    default: op
+  dac.join:
+    description: Permet de rejoindre une partie
+    default: true

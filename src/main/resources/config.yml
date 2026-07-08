@@ -1,0 +1,39 @@
+# ===================================================
+#   Configuration du minigame "Dé à Coudre"
+#   La plupart de ces valeurs peuvent aussi être
+#   modifiées en jeu avec les commandes /dac ...
+# ===================================================
+
+joueurs:
+  min: 2
+  max: 16
+
+lobby:
+  countdown-secondes: 15
+  # position définie via /dac setlobby
+  monde: ""
+  x: 0.0
+  y: 0.0
+  z: 0.0
+  yaw: 0.0
+  pitch: 0.0
+
+zone:
+  # position définie via /dac setcenter
+  monde: ""
+  centre-x: 0
+  centre-z: 0
+  # rayon en blocs (taille de la zone), définie via /dac settaille
+  taille: 25
+  # hauteur à laquelle l'eau commence à monter, /dac sethauteurdepart
+  hauteur-depart: 64
+  # hauteur max que l'eau peut atteindre, /dac sethauteurmax
+  hauteur-max: 100
+
+eau:
+  # temps en secondes entre chaque montée du niveau d'eau
+  intervalle-secondes: 5
+  # nombre de blocs dont le niveau monte à chaque intervalle
+  blocs-par-montee: 1
+
+spawns: []
