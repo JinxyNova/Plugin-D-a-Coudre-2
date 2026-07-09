@@ -1,49 +1,500 @@
-<project xmlns="http://maven.apache.org/POM/4.0.0">
-    <modelVersion>4.0.0</modelVersion>
+package fr.merci.deacoudre.game;
 
-    <groupId>fr.merci</groupId>
-    <artifactId>deacoudre</artifactId>
-    <version>1.0.0</version>
-    <packaging>jar</packaging>
+import org.bukkit.*;
+import org.bukkit.block.Block;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.scheduler.BukkitTask;
 
-    <name>DeACoudre</name>
-    <description>Minigame "Dé à Coudre" - zone qui se remplit d'eau, dernier survivant gagne</description>
+import java.util.*;
 
-    <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    </properties>
+/**
+ * Gère l'état de la partie : lobby, countdown, montée de l'eau,
+ * élimination des joueurs, victoire.
+ */
+public class GameManager {
 
-    <repositories>
-        <repository>
-            <id>papermc</id>
-            <url>https://repo.papermc.io/repository/maven-public/</url>
-        </repository>
-    </repositories>
+    private final JavaPlugin plugin;
+    private final ArenaConfig arenaConfig;
 
-    <dependencies>
-        <dependency>
-            <groupId>io.papermc.paper</groupId>
-            <artifactId>paper-api</artifactId>
-            <version>1.20.4-R0.1-SNAPSHOT</version>
-            <scope>provided</scope>
-        </dependency>
-    </dependencies>
+    private GameState state = GameState.LOBBY;
 
-    <build>
-        <finalName>${project.name}-${project.version}</finalName>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
-            </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-resources-plugin</artifactId>
-                <version>3.3.1</version>
-            </plugin>
-        </plugins>
-    </build>
-</project>
+    private final Set<UUID> joueurs = new LinkedHashSet<>();
+    private final Set<UUID> vivants = new HashSet<>();
+    private final Set<UUID> spectateurs = new HashSet<>();
+
+    private BukkitTask countdownTask;
+    private BukkitTask waterTask;
+    private int countdownRestant;
+    private int niveauEauActuel;
+
+    // Positions (encodées) où le fluide a réellement été posé pendant la partie en cours.
+    // Permet de ne nettoyer QUE ces blocs au reset, sans jamais rescanner toute la zone.
+    private final Set<Long> blocsModifies = new HashSet<>();
+    // Pour chaque colonne (x,z) déjà visitée par un joueur, la hauteur jusqu'à laquelle
+    // elle a déjà été remplie. Évite de reparcourir toute la hauteur à chaque tick pour
+    // un joueur qui reste immobile : gain de performance important sur les grandes zones.
+    private final Map<Long, Integer> sommetColonne = new HashMap<>();
+
+    public GameManager(JavaPlugin plugin, ArenaConfig arenaConfig) {
+        this.plugin = plugin;
+        this.arenaConfig = arenaConfig;
+    }
+
+    public GameState getState() {
+        return state;
+    }
+
+    public ArenaConfig getArenaConfig() {
+        return arenaConfig;
+    }
+
+    public boolean estEnJeu(UUID uuid) {
+        return joueurs.contains(uuid);
+    }
+
+    public int nombreJoueurs() {
+        return joueurs.size();
+    }
+
+    // ---------------------------------------------------------------
+    // Rejoindre / Quitter
+    // ---------------------------------------------------------------
+
+    public String rejoindre(Player player) {
+        if (state == GameState.EN_COURS || state == GameState.TERMINEE) {
+            return ChatColor.RED + "Une partie est déjà en cours, attends la prochaine !";
+        }
+        if (!arenaConfig.zoneEstConfiguree()) {
+            return ChatColor.RED + "La zone de jeu n'est pas encore configurée (voir /dac setcenter).";
+        }
+        if (arenaConfig.lobby == null) {
+            return ChatColor.RED + "Le lobby n'est pas encore configuré (voir /dac setlobby).";
+        }
+        if (joueurs.size() >= arenaConfig.maxJoueurs) {
+            return ChatColor.RED + "La partie est complète (" + arenaConfig.maxJoueurs + " joueurs max).";
+        }
+        if (joueurs.contains(player.getUniqueId())) {
+            return ChatColor.YELLOW + "Tu es déjà dans la partie !";
+        }
+
+        joueurs.add(player.getUniqueId());
+        player.teleport(arenaConfig.lobby);
+        player.setGameMode(GameMode.ADVENTURE);
+        player.setHealth(20);
+        player.setFoodLevel(20);
+
+        broadcast(ChatColor.AQUA + player.getName() + ChatColor.GRAY + " a rejoint la partie ! ("
+                + joueurs.size() + "/" + arenaConfig.maxJoueurs + ")");
+
+        verifierLancementCountdown();
+        return ChatColor.GREEN + "Tu as rejoint la partie DeACoudre !";
+    }
+
+    public String quitter(Player player) {
+        if (!joueurs.contains(player.getUniqueId())) {
+            return ChatColor.YELLOW + "Tu n'es pas dans une partie.";
+        }
+        retirerJoueur(player.getUniqueId(), false);
+        return ChatColor.GREEN + "Tu as quitté la partie.";
+    }
+
+    private void retirerJoueur(UUID uuid, boolean elimine) {
+        joueurs.remove(uuid);
+        vivants.remove(uuid);
+        spectateurs.remove(uuid);
+
+        Player player = Bukkit.getPlayer(uuid);
+        if (player != null && !elimine) {
+            if (arenaConfig.lobby != null) {
+                player.teleport(arenaConfig.lobby.getWorld().getSpawnLocation());
+            }
+            player.setGameMode(GameMode.SURVIVAL);
+        }
+
+        if (state == GameState.EN_COURS) {
+            verifierVictoire();
+        } else if (state == GameState.COUNTDOWN && joueurs.size() < arenaConfig.minJoueurs) {
+            annulerCountdown();
+            broadcast(ChatColor.YELLOW + "Pas assez de joueurs, le compte à rebours est annulé.");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Countdown du lobby
+    // ---------------------------------------------------------------
+
+    private void verifierLancementCountdown() {
+        if (state == GameState.LOBBY && joueurs.size() >= arenaConfig.minJoueurs) {
+            demarrerCountdown();
+        }
+    }
+
+    private void demarrerCountdown() {
+        state = GameState.COUNTDOWN;
+        countdownRestant = arenaConfig.countdownSecondes;
+
+        countdownTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (joueurs.size() < arenaConfig.minJoueurs) {
+                    broadcast(ChatColor.YELLOW + "Pas assez de joueurs, le compte à rebours est annulé.");
+                    annulerCountdown();
+                    return;
+                }
+                if (countdownRestant <= 0) {
+                    demarrerPartie();
+                    this.cancel();
+                    return;
+                }
+                if (countdownRestant <= 5 || countdownRestant % 10 == 0) {
+                    broadcast(ChatColor.GOLD + "Départ dans " + ChatColor.YELLOW + countdownRestant
+                            + ChatColor.GOLD + " seconde(s) !");
+                }
+                countdownRestant--;
+            }
+        }.runTaskTimer(plugin, 0L, 20L);
+    }
+
+    private void annulerCountdown() {
+        if (countdownTask != null) {
+            countdownTask.cancel();
+            countdownTask = null;
+        }
+        state = GameState.LOBBY;
+    }
+
+    public String forcerDepart() {
+        if (state == GameState.EN_COURS) {
+            return ChatColor.RED + "Une partie est déjà en cours.";
+        }
+        if (joueurs.isEmpty()) {
+            return ChatColor.RED + "Aucun joueur dans le lobby.";
+        }
+        if (countdownTask != null) {
+            countdownTask.cancel();
+            countdownTask = null;
+        }
+        demarrerPartie();
+        return ChatColor.GREEN + "Partie lancée de force !";
+    }
+
+    // ---------------------------------------------------------------
+    // Déroulement de la partie
+    // ---------------------------------------------------------------
+
+    private void demarrerPartie() {
+        World monde = arenaConfig.getZoneMonde();
+        if (monde == null) {
+            broadcast(ChatColor.RED + "Erreur : le monde de la zone n'existe pas. Partie annulée.");
+            resetComplet();
+            return;
+        }
+
+        state = GameState.EN_COURS;
+        vivants.clear();
+        vivants.addAll(joueurs);
+        spectateurs.clear();
+        niveauEauActuel = arenaConfig.hauteurDepart;
+        blocsModifies.clear();
+        sommetColonne.clear();
+
+        teleporterJoueursSurSpawns(monde);
+
+        broadcast(ChatColor.GREEN + "La partie commence ! " + nomFluideMaj()
+                + " va bientôt monter, ne te fais pas piéger !");
+
+        waterTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (state != GameState.EN_COURS) {
+                    this.cancel();
+                    return;
+                }
+                monterFluide(monde);
+                verifierEliminations(monde);
+                verifierVictoire();
+            }
+        }.runTaskTimer(plugin, arenaConfig.intervalleSecondes * 20L, arenaConfig.intervalleSecondes * 20L);
+    }
+
+    private void teleporterJoueursSurSpawns(World monde) {
+        List<Location> spawns = arenaConfig.spawns;
+        int i = 0;
+        for (UUID uuid : joueurs) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player == null) continue;
+
+            Location dest;
+            if (!spawns.isEmpty()) {
+                dest = spawns.get(i % spawns.size());
+            } else {
+                // pas de spawn défini : on place les joueurs en cercle au centre de la zone,
+                // en hauteur, au-dessus du niveau de départ de l'eau
+                double angle = (2 * Math.PI / Math.max(1, joueurs.size())) * i;
+                double rayon = Math.max(1, arenaConfig.taille - 2);
+                double x = arenaConfig.centreX + rayon * Math.cos(angle);
+                double z = arenaConfig.centreZ + rayon * Math.sin(angle);
+                dest = new Location(monde, x, arenaConfig.hauteurMax, z);
+            }
+
+            player.teleport(dest);
+            player.setGameMode(GameMode.SURVIVAL);
+            player.setHealth(20);
+            player.setFoodLevel(20);
+            i++;
+        }
+    }
+
+    /**
+     * Fait monter le niveau du fluide (logique pure, indépendante des blocs).
+     * Le rendu visuel (pose des blocs) est ensuite délégué à
+     * {@link #rafraichirFluideAutourJoueurs(World)}, qui ne s'occupe que des
+     * zones proches des joueurs vivants : sur une grande arène avec peu de
+     * joueurs, on évite ainsi de parcourir des milliers de blocs inutiles.
+     */
+    private void monterFluide(World monde) {
+        int prochainNiveau = Math.min(niveauEauActuel + arenaConfig.blocsParMontee, arenaConfig.hauteurMax);
+        if (prochainNiveau <= niveauEauActuel) {
+            return; // déjà au maximum
+        }
+
+        niveauEauActuel = prochainNiveau;
+        rafraichirFluideAutourJoueurs(monde);
+
+        broadcast(ChatColor.BLUE + "Le niveau de " + nomFluide() + " monte... (niveau " + niveauEauActuel + ")");
+    }
+
+    /**
+     * Pose le fluide uniquement dans un rayon (cercle) autour de chaque joueur
+     * encore vivant, entre la hauteur de départ et le niveau actuel.
+     * Un cache par colonne (sommetColonne) évite de rescanner toute la hauteur
+     * pour un joueur qui reste sur place : on ne traite que les nouvelles couches.
+     */
+    private void rafraichirFluideAutourJoueurs(World monde) {
+        int rayon = Math.max(1, arenaConfig.rayonFluide);
+        int rayonCarre = rayon * rayon;
+        Material materiau = arenaConfig.materiauFluide;
+
+        for (UUID uuid : vivants) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player == null || !player.isOnline() || !player.getWorld().equals(monde)) {
+                continue;
+            }
+
+            int px = player.getLocation().getBlockX();
+            int pz = player.getLocation().getBlockZ();
+
+            int minX = Math.max(arenaConfig.minX(), px - rayon);
+            int maxX = Math.min(arenaConfig.maxX(), px + rayon);
+            int minZ = Math.max(arenaConfig.minZ(), pz - rayon);
+            int maxZ = Math.min(arenaConfig.maxZ(), pz + rayon);
+
+            for (int x = minX; x <= maxX; x++) {
+                int dx = x - px;
+                int dxCarre = dx * dx;
+                for (int z = minZ; z <= maxZ; z++) {
+                    int dz = z - pz;
+                    if (dxCarre + dz * dz > rayonCarre) {
+                        continue; // en dehors du cercle : on ignore (au lieu de remplir un carré)
+                    }
+
+                    long cleColonne = packKey2D(x, z);
+                    int depart = sommetColonne.getOrDefault(cleColonne, arenaConfig.hauteurDepart);
+                    if (depart >= niveauEauActuel) {
+                        continue; // cette colonne est déjà remplie jusqu'au niveau actuel
+                    }
+
+                    for (int y = depart; y < niveauEauActuel; y++) {
+                        Block bloc = monde.getBlockAt(x, y, z);
+                        if (bloc.getType() == Material.AIR || bloc.getType() == Material.CAVE_AIR) {
+                            bloc.setType(materiau, false);
+                            blocsModifies.add(packKey(x, y, z));
+                        }
+                    }
+                    sommetColonne.put(cleColonne, niveauEauActuel);
+                }
+            }
+        }
+    }
+
+    /**
+     * L'élimination est basée uniquement sur la position Y du joueur par rapport
+     * au niveau actuel du fluide, pas sur la présence d'un bloc d'eau/lave sous
+     * ses pieds. Comme le fluide ne remplit visuellement que les zones proches
+     * des joueurs (optimisation), un joueur qui se déplacerait dans une zone pas
+     * encore "peinte" doit quand même être noyé s'il est réellement sous le niveau.
+     * Ce contrôle est en O(1) par joueur, donc extrêmement rapide.
+     */
+    private void verifierEliminations(World monde) {
+        for (UUID uuid : new ArrayList<>(vivants)) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player == null || !player.isOnline()) {
+                continue;
+            }
+            if (!player.getWorld().equals(monde)) {
+                continue;
+            }
+            if (player.getLocation().getY() < niveauEauActuel) {
+                eliminer(player);
+            }
+        }
+    }
+
+    private void eliminer(Player player) {
+        vivants.remove(player.getUniqueId());
+        spectateurs.add(player.getUniqueId());
+        player.setGameMode(GameMode.SPECTATOR);
+        if (arenaConfig.lobby != null) {
+            player.teleport(arenaConfig.lobby);
+        }
+        broadcast(ChatColor.RED + player.getName() + " a été englouti par " + nomFluide() + " ! ("
+                + vivants.size() + " restant(s))");
+    }
+
+    private void verifierVictoire() {
+        if (state != GameState.EN_COURS) return;
+
+        if (vivants.size() == 1) {
+            UUID gagnantId = vivants.iterator().next();
+            Player gagnant = Bukkit.getPlayer(gagnantId);
+            String nom = gagnant != null ? gagnant.getName() : "Inconnu";
+            broadcast(ChatColor.GOLD + "" + ChatColor.BOLD + nom + " a gagné la partie DeACoudre !");
+            terminerPartie();
+        } else if (vivants.isEmpty()) {
+            broadcast(ChatColor.YELLOW + "Aucun survivant... la partie se termine sans vainqueur.");
+            terminerPartie();
+        }
+    }
+
+    private void terminerPartie() {
+        state = GameState.TERMINEE;
+        if (waterTask != null) {
+            waterTask.cancel();
+            waterTask = null;
+        }
+
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                resetComplet();
+            }
+        }.runTaskLater(plugin, 100L); // 5 secondes avant reset du lobby
+    }
+
+    public String arreter(org.bukkit.command.CommandSender sender) {
+        if (state == GameState.LOBBY) {
+            return ChatColor.YELLOW + "Aucune partie en cours.";
+        }
+        broadcast(ChatColor.RED + "La partie a été arrêtée par un administrateur.");
+        if (waterTask != null) {
+            waterTask.cancel();
+            waterTask = null;
+        }
+        resetComplet();
+        return ChatColor.GREEN + "Partie arrêtée et réinitialisée.";
+    }
+
+    private void resetComplet() {
+        World monde = arenaConfig.getZoneMonde();
+        if (monde != null) {
+            viderFluide(monde);
+        }
+
+        for (UUID uuid : joueurs) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null) {
+                player.setGameMode(GameMode.SURVIVAL);
+                if (arenaConfig.lobby != null) {
+                    player.teleport(arenaConfig.lobby.getWorld().getSpawnLocation());
+                }
+            }
+        }
+
+        joueurs.clear();
+        vivants.clear();
+        spectateurs.clear();
+        state = GameState.LOBBY;
+        niveauEauActuel = arenaConfig.hauteurDepart;
+    }
+
+    /**
+     * Ne nettoie que les blocs réellement transformés en fluide pendant la partie
+     * (mémorisés dans blocsModifies), au lieu de reparcourir toute la zone
+     * configurée. Sur une grande arène avec peu de joueurs, c'est nettement
+     * plus rapide qu'un triple parcours complet.
+     */
+    private void viderFluide(World monde) {
+        for (Long cle : blocsModifies) {
+            int[] xyz = unpackKey(cle);
+            Block bloc = monde.getBlockAt(xyz[0], xyz[1], xyz[2]);
+            Material type = bloc.getType();
+            if (type == Material.WATER || type == Material.LAVA) {
+                bloc.setType(Material.AIR, false);
+            }
+        }
+        blocsModifies.clear();
+        sommetColonne.clear();
+        niveauEauActuel = arenaConfig.hauteurDepart;
+    }
+
+    private String nomFluide() {
+        return arenaConfig.materiauFluide == Material.LAVA ? "la lave" : "l'eau";
+    }
+
+    private String nomFluideMaj() {
+        return arenaConfig.materiauFluide == Material.LAVA ? "La lave" : "L'eau";
+    }
+
+    // ---------------------------------------------------------------
+    // Encodage/décodage de coordonnées (x,y,z) et (x,z) sur un long,
+    // pour stocker efficacement les positions modifiées sans allocation
+    // d'objets Location. Marges larges pour couvrir toute taille de monde.
+    // ---------------------------------------------------------------
+
+    private static long packKey(int x, int y, int z) {
+        long xi = x + 30_000_000L;
+        long yi = y + 500L;
+        long zi = z + 30_000_000L;
+        return (xi << 36) | (yi << 26) | zi;
+    }
+
+    private static int[] unpackKey(long cle) {
+        int z = (int) ((cle & 0x3FFFFFFL) - 30_000_000L);
+        int y = (int) (((cle >> 26) & 0x3FFL) - 500L);
+        int x = (int) ((cle >> 36) - 30_000_000L);
+        return new int[]{x, y, z};
+    }
+
+    private static long packKey2D(int x, int z) {
+        long xi = x + 30_000_000L;
+        long zi = z + 30_000_000L;
+        return (xi << 27) | zi;
+    }
+
+    private void broadcast(String message) {
+        for (UUID uuid : joueurs) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null) {
+                player.sendMessage(ChatColor.DARK_AQUA + "[DeACoudre] " + ChatColor.RESET + message);
+            }
+        }
+    }
+
+    /**
+     * À appeler quand un joueur se déconnecte pendant qu'il est engagé dans une partie.
+     */
+    public void gererDeconnexion(UUID uuid) {
+        if (!joueurs.contains(uuid)) return;
+        boolean etaitEnJeu = state == GameState.EN_COURS;
+        joueurs.remove(uuid);
+        vivants.remove(uuid);
+        spectateurs.remove(uuid);
+        if (etaitEnJeu) {
+            verifierVictoire();
+        } else if (state == GameState.COUNTDOWN && joueurs.size() < arenaConfig.minJoueurs) {
+            annulerCountdown();
+        }
+    }
+}
